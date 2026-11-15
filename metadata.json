@@ -1,0 +1,6 @@
+{
+  "name": "Verbatim",
+  "description": "Extract accurate timestamped or plain-text transcripts from YouTube, TikTok, Instagram, Facebook, X, Vimeo, and direct media links.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

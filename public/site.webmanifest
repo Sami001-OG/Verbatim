@@ -1,0 +1,26 @@
+{
+  "name": "Verbatim — Link-to-Transcript Studio",
+  "short_name": "Verbatim",
+  "description": "Extract accurate timestamped or plain-text transcripts from any video or audio link.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/favicon.png",
+      "sizes": "64x64",
+      "type": "image/png"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}
