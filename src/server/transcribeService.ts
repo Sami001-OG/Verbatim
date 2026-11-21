@@ -1,11 +1,16 @@
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { execFile } from 'node:child_process';
+import dns from 'node:dns';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { ExtractionMethod, PlatformType, TranscriptResult, TranscriptSegment } from '../types/transcript.ts';
 import { getLanguageCode } from '../utils/languages.ts';
+import {
+  buildPlatformFetchCandidates,
+  discoverMediaUrlsFromHtml,
+} from '../utils/mediaDiscovery.ts';
 import { getPlatformLabel, parseSourceUrl } from '../utils/urlParser.ts';
 import {
   cleanSegmentText,
@@ -16,6 +21,12 @@ import {
   parseYouTubeTimedTextXml,
 } from '../utils/transcriptParser.ts';
 
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // Ignore if unsupported in runtime
+}
+
 const execFileAsync = promisify(execFile);
 
 const MAX_MEDIA_BYTES = 24 * 1024 * 1024; // 24 MB safety limit
@@ -25,6 +36,16 @@ const BROWSER_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Accept-Language': 'en-US,en;q=0.9',
+};
+
+const PAGE_NAV_HEADERS = {
+  ...BROWSER_HEADERS,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
 };
 
 export class TranscriptionError extends Error {
@@ -48,9 +69,9 @@ function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!hasValidGeminiKey() || !apiKey) {
     throw new TranscriptionError(
-      'No Gemini API key is configured for raw audio/video AI transcription.',
+      'GEMINI_API_KEY is not configured in this deployment environment.',
       422,
-      'YouTube videos with captions and multi-language translation work without an API key. To transcribe raw uncaptioned audio/video streams, configure GEMINI_API_KEY.',
+      'In Vercel, open Project Settings → Environment Variables, add GEMINI_API_KEY (from Google AI Studio), and redeploy.',
     );
   }
   return new GoogleGenAI({
@@ -130,51 +151,85 @@ async function tryYouTubeCaptions(
   language: string;
   durationSec: number;
   segments: TranscriptSegment[];
+  datacenterBlocked?: boolean;
 } | null> {
   let captionTracks: YouTubeCaptionTrack[] = [];
   let title = 'YouTube Video';
   let author: string | undefined;
   let durationSec = 0;
+  let datacenterBlocked = false;
 
-  // 1. Try Innertube Android player endpoint (frequently provides unencrypted captionTracks)
-  try {
-    const playerResp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip',
+  // 1. Try current Innertube mobile player endpoints (ANDROID 20.x and IOS 20.x)
+  const mobileClients = [
+    {
+      ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+      client: {
+        clientName: 'ANDROID',
+        clientVersion: '20.10.38',
+        androidSdkVersion: 34,
+        osName: 'Android',
+        osVersion: '14',
+        hl: 'en',
+        gl: 'US',
       },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: 'ANDROID',
-            clientVersion: '19.29.37',
-            androidSdkVersion: 30,
-            hl: 'en',
-            gl: 'US',
-          },
-        },
-        videoId,
-      }),
-    });
+    },
+    {
+      ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)',
+      client: {
+        clientName: 'IOS',
+        clientVersion: '20.10.4',
+        deviceMake: 'Apple',
+        deviceModel: 'iPhone16,2',
+        osName: 'iPhone',
+        osVersion: '18.3.1.22D72',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+  ];
 
-    if (playerResp.ok) {
-      const data = (await playerResp.json()) as {
-        videoDetails?: { title?: string; author?: string; lengthSeconds?: string };
-        captions?: { playerCaptionsTracklistRenderer?: { captionTracks?: YouTubeCaptionTrack[] } };
-      };
-      if (data.videoDetails?.title) title = data.videoDetails.title;
-      if (data.videoDetails?.author) author = data.videoDetails.author;
-      if (data.videoDetails?.lengthSeconds) {
-        durationSec = parseInt(data.videoDetails.lengthSeconds, 10) || 0;
+  for (const profile of mobileClients) {
+    if (captionTracks.length > 0) break;
+    try {
+      const playerResp = await fetchWithTimeout(
+        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': profile.ua,
+          },
+          body: JSON.stringify({
+            context: { client: profile.client },
+            videoId,
+          }),
+        },
+      );
+
+      if (playerResp.ok) {
+        const data = (await playerResp.json()) as {
+          playabilityStatus?: { status?: string; reason?: string };
+          videoDetails?: { title?: string; author?: string; lengthSeconds?: string };
+          captions?: {
+            playerCaptionsTracklistRenderer?: { captionTracks?: YouTubeCaptionTrack[] };
+          };
+        };
+        if (data.playabilityStatus?.status === 'LOGIN_REQUIRED') {
+          datacenterBlocked = true;
+        }
+        if (data.videoDetails?.title) title = data.videoDetails.title;
+        if (data.videoDetails?.author) author = data.videoDetails.author;
+        if (data.videoDetails?.lengthSeconds) {
+          durationSec = parseInt(data.videoDetails.lengthSeconds, 10) || 0;
+        }
+        captionTracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
       }
-      captionTracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+    } catch {
+      // Try next profile
     }
-  } catch {
-    // Fall through to HTML watch page extraction
   }
 
-  // 2. Fallback: scrape ytInitialPlayerResponse from watch page HTML
+  // 2. Fallback: scrape captionTracks from watch page HTML
   if (captionTracks.length === 0) {
     try {
       const watchResp = await fetchWithTimeout(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
@@ -185,29 +240,18 @@ async function tryYouTubeCaptions(
         const titleMatch = /<meta\s+name="title"\s+content="([^"]+)"/i.exec(html);
         if (titleMatch?.[1]) title = decodeHtmlEntities(titleMatch[1]);
 
-        const playerMarker = 'ytInitialPlayerResponse = ';
-        const idx = html.indexOf(playerMarker);
-        if (idx !== -1) {
-          const slice = html.slice(idx + playerMarker.length);
-          const endIdx = slice.indexOf(';</script>');
-          const jsonCandidate = endIdx !== -1 ? slice.slice(0, endIdx) : '';
-          if (jsonCandidate) {
-            try {
-              const parsed = JSON.parse(jsonCandidate) as {
-                videoDetails?: { title?: string; author?: string; lengthSeconds?: string };
-                captions?: {
-                  playerCaptionsTracklistRenderer?: { captionTracks?: YouTubeCaptionTrack[] };
-                };
-              };
-              if (parsed.videoDetails?.title) title = parsed.videoDetails.title;
-              if (parsed.videoDetails?.author) author = parsed.videoDetails.author;
-              if (parsed.videoDetails?.lengthSeconds) {
-                durationSec = parseInt(parsed.videoDetails.lengthSeconds, 10) || 0;
-              }
-              captionTracks = parsed.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
-            } catch {
-              // Ignore malformed inline JSON
-            }
+        if (html.includes('"LOGIN_REQUIRED"') && html.includes('not a bot')) {
+          datacenterBlocked = true;
+        }
+
+        const tracksMatch = /"captionTracks":(\[.*?\])(?:,"audioTracks"|,"translationLanguages"|,"defaultAudioTrackIndex"|\})/s.exec(
+          html,
+        );
+        if (tracksMatch?.[1]) {
+          try {
+            captionTracks = JSON.parse(tracksMatch[1]) as YouTubeCaptionTrack[];
+          } catch {
+            // Ignore malformed captionTracks JSON
           }
         }
       }
@@ -217,6 +261,16 @@ async function tryYouTubeCaptions(
   }
 
   if (captionTracks.length === 0) {
+    if (datacenterBlocked) {
+      return {
+        title,
+        author,
+        language: 'English',
+        durationSec,
+        segments: [],
+        datacenterBlocked: true,
+      };
+    }
     return null;
   }
 
@@ -439,36 +493,57 @@ export async function transcribeAudioBufferWithGemini(
     ? 'Only populate speaker (e.g., their spoken name, or Speaker 1 / Speaker 2) when two or more distinct voices are conversing. If only one person speaks, leave speaker as an empty string "". NEVER use "Narrator", "Voiceover", or "Announcer".'
     : 'Leave speaker completely empty (""). NEVER include speaker prefixes or the word "Narrator" in text.';
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType: finalMime,
-            data: audioBase64,
-          },
-        },
-        {
-          text: [
-            'Produce an accurate, verbatim timestamped transcript of all spoken words in this audio.',
-            'Break segments cleanly at natural sentence or clause boundaries (roughly 3 to 12 seconds per segment) with accurate startSec and endSec in seconds.',
-            'Output only the exact spoken words in text—never prepend "Narrator:", speaker labels, or stage brackets like [Narrator].',
-            'Do not paraphrase, summarize, or skip words. Set accessible=true if speech or audio is present.',
-            languageRule,
-            speakerRule,
-          ].join(' '),
-        },
-      ],
-    },
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-    },
-  });
+  const promptText = [
+    'Produce an accurate, verbatim timestamped transcript of all spoken words in this audio.',
+    'Break segments cleanly at natural sentence or clause boundaries (roughly 3 to 12 seconds per segment) with accurate startSec and endSec in seconds.',
+    'Output only the exact spoken words in text—never prepend "Narrator:", speaker labels, or stage brackets like [Narrator].',
+    'Do not paraphrase, summarize, or skip words. Set accessible=true if speech or audio is present.',
+    languageRule,
+    speakerRule,
+  ].join(' ');
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as StructuredTranscriptPayload;
+  const modelAttempts: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
+    { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+    { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+  ];
+
+  let responseText = '{}';
+  let lastModelError: unknown;
+
+  for (const attempt of modelAttempts) {
+    try {
+      const response = await ai.models.generateContent({
+        model: attempt.model,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: finalMime,
+                data: audioBase64,
+              },
+            },
+            { text: promptText },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
+          thinkingConfig: { thinkingLevel: attempt.thinkingLevel },
+        },
+      });
+      responseText = (response.text ?? '{}').trim();
+      lastModelError = undefined;
+      break;
+    } catch (err) {
+      lastModelError = err;
+    }
+  }
+
+  if (lastModelError) {
+    throw lastModelError;
+  }
+
+  const parsed = JSON.parse(responseText || '{}') as StructuredTranscriptPayload;
   const segments = normalizeSegments(parsed.segments ?? []);
 
   if (segments.length === 0) {
@@ -579,89 +654,6 @@ async function transcribeYouTubeViaGeminiVideo(
   };
 }
 
-function extractHtmlMeta(html: string, propertyOrName: string): string | undefined {
-  const regex = new RegExp(
-    `<meta[^>]+(?:property|name)=["']${propertyOrName}["'][^>]+content=["']([^"']+)["']`,
-    'i',
-  );
-  const reverseRegex = new RegExp(
-    `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${propertyOrName}["']`,
-    'i',
-  );
-  const match = regex.exec(html) || reverseRegex.exec(html);
-  return match?.[1] ? decodeHtmlEntities(match[1]) : undefined;
-}
-
-function discoverMediaUrlsFromHtml(html: string): {
-  subtitleUrls: string[];
-  mediaUrls: string[];
-  title?: string;
-  author?: string;
-} {
-  const subtitleUrls: string[] = [];
-  const mediaUrls: string[] = [];
-
-  const title =
-    extractHtmlMeta(html, 'og:title') ||
-    extractHtmlMeta(html, 'twitter:title') ||
-    decodeHtmlEntities((/<title[^>]*>([^<]+)<\/title>/i.exec(html)?.[1] ?? '').trim());
-
-  const author =
-    extractHtmlMeta(html, 'og:site_name') ||
-    extractHtmlMeta(html, 'author') ||
-    undefined;
-
-  const metaCandidates = [
-    extractHtmlMeta(html, 'og:video:secure_url'),
-    extractHtmlMeta(html, 'og:video:url'),
-    extractHtmlMeta(html, 'og:video'),
-    extractHtmlMeta(html, 'og:audio'),
-    extractHtmlMeta(html, 'twitter:player:stream'),
-  ].filter((u): u is string => Boolean(u && u.startsWith('http')));
-
-  for (const url of metaCandidates) {
-    if (!url.includes('.m3u8')) mediaUrls.push(url);
-  }
-
-  // Look for embedded JSON video / subtitle URLs (TikTok, Instagram, Facebook, Vimeo, X)
-  const jsonUrlPatterns = [
-    /"(?:playable_url_quality_hd|playable_url|browser_native_hd_url|browser_native_sd_url|playAddr|downloadAddr|contentUrl|video_url|sd_src|hd_src)"\s*:\s*"(https?:[^"]+)"/gi,
-    /<(?:video|audio|source)[^>]+src=["'](https?:[^"']+)["']/gi,
-  ];
-
-  for (const pattern of jsonUrlPatterns) {
-    let m: RegExpExecArray | null;
-    while ((m = pattern.exec(html)) !== null) {
-      const unescaped = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-      if (unescaped.startsWith('http') && !unescaped.includes('.m3u8')) {
-        mediaUrls.push(unescaped);
-      }
-    }
-  }
-
-  const subtitlePatterns = [
-    /"(?:url|baseUrl|src)"\s*:\s*"(https?:[^"]+\.(?:vtt|srt)[^"]*)"/gi,
-    /<track[^>]+src=["'](https?:[^"']+\.(?:vtt|srt)[^"']*)["']/gi,
-  ];
-
-  for (const pattern of subtitlePatterns) {
-    let m: RegExpExecArray | null;
-    while ((m = pattern.exec(html)) !== null) {
-      const unescaped = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-      if (unescaped.startsWith('http')) {
-        subtitleUrls.push(unescaped);
-      }
-    }
-  }
-
-  return {
-    subtitleUrls: Array.from(new Set(subtitleUrls)),
-    mediaUrls: Array.from(new Set(mediaUrls)),
-    title: title || undefined,
-    author,
-  };
-}
-
 async function downloadBoundedBytes(url: string): Promise<{ buffer: Buffer; contentType: string } | null> {
   const resp = await fetchWithTimeout(url, { headers: BROWSER_HEADERS }, 20000);
   if (!resp.ok) return null;
@@ -731,6 +723,14 @@ export async function transcribeFromLink(params: {
       return baseResult;
     }
 
+    if (captionData?.datacenterBlocked && !hasValidGeminiKey()) {
+      throw new TranscriptionError(
+        'YouTube blocked anonymous caption scraping from this cloud server IP ("Sign in to confirm you’re not a bot"), and GEMINI_API_KEY is not set.',
+        422,
+        'In Vercel Dashboard → Project Settings → Environment Variables, add GEMINI_API_KEY (from Google AI Studio) and redeploy so Verbatim can extract YouTube transcripts from cloud servers.',
+      );
+    }
+
     return await transcribeYouTubeViaGeminiVideo(
       parsed.normalizedUrl,
       params.url,
@@ -739,15 +739,31 @@ export async function transcribeFromLink(params: {
     );
   }
 
-  // 2. Probe URL headers/content for direct media or HTML metadata
-  let pageResp: Response | null = null;
-  try {
-    pageResp = await fetchWithTimeout(parsed.normalizedUrl, { headers: BROWSER_HEADERS });
-  } catch {
-    pageResp = null;
-  }
+  // 2. Probe URL (plus platform-specific mobile/embed fallbacks) for direct media or HTML streams
+  const fetchCandidates = buildPlatformFetchCandidates(parsed.normalizedUrl, parsed.platform);
+  const subtitleQueue: string[] = [];
+  const streamQueue: Array<{ url: string; kind: 'audio' | 'video' }> = [];
+  let discoveredTitle: string | undefined;
+  let discoveredAuthor: string | undefined;
 
-  if (pageResp && pageResp.ok) {
+  for (const candidateUrl of fetchCandidates) {
+    let pageResp: Response | null = null;
+    try {
+      const isMobileFb = candidateUrl.includes('://m.facebook.com/');
+      const headers = isMobileFb
+        ? {
+            ...PAGE_NAV_HEADERS,
+            'User-Agent':
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+          }
+        : PAGE_NAV_HEADERS;
+      pageResp = await fetchWithTimeout(candidateUrl, { headers });
+    } catch {
+      pageResp = null;
+    }
+
+    if (!pageResp || !pageResp.ok) continue;
+
     const contentType = (pageResp.headers.get('content-type') || '').toLowerCase();
 
     // Direct audio/video URL
@@ -770,67 +786,134 @@ export async function transcribeFromLink(params: {
       });
     }
 
-    // HTML page (TikTok, Instagram, Facebook, X, Vimeo, etc.)
+    // HTML page (Facebook, Instagram, TikTok, X, Vimeo, etc.)
     if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
       const html = await pageResp.text();
-      const discovered = discoverMediaUrlsFromHtml(html);
+      const discovered = discoverMediaUrlsFromHtml(html, parsed.platform);
 
-      // 2a. Check discovered VTT/SRT subtitle tracks
-      for (const subUrl of discovered.subtitleUrls) {
-        try {
-          const subResp = await fetchWithTimeout(subUrl, { headers: BROWSER_HEADERS });
-          if (subResp.ok) {
-            const subText = await subResp.text();
-            const segs = parseVttOrSrtText(subText);
-            if (segs.length > 0) {
-              return {
-                id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                sourceUrl: params.url,
-                normalizedUrl: parsed.normalizedUrl,
-                platform: parsed.platform,
-                title: discovered.title || `${getPlatformLabel(parsed.platform)} Transcript`,
-                author: discovered.author,
-                language: params.language && params.language !== 'auto' ? params.language : 'Auto-detected',
-                durationSec: segs[segs.length - 1]?.endSec ?? 0,
-                extractionMethod: 'caption-track' as ExtractionMethod,
-                segments: segs,
-                createdAt: new Date().toISOString(),
-              };
-            }
-          }
-        } catch {
-          // Try next subtitle URL
-        }
+      if (!discoveredTitle && discovered.title) discoveredTitle = discovered.title;
+      if (!discoveredAuthor && discovered.author) discoveredAuthor = discovered.author;
+
+      subtitleQueue.push(...discovered.subtitleUrls);
+      for (const au of discovered.audioUrls) {
+        streamQueue.push({ url: au, kind: 'audio' });
+      }
+      for (const mu of discovered.mediaUrls) {
+        streamQueue.push({ url: mu, kind: 'video' });
       }
 
-      // 2b. Check discovered direct video/audio streams embedded in page HTML/OG tags
-      for (const mediaUrl of discovered.mediaUrls) {
-        try {
-          const downloaded = await downloadBoundedBytes(mediaUrl);
-          if (
-            downloaded &&
-            (downloaded.contentType.startsWith('video/') ||
-              downloaded.contentType.startsWith('audio/') ||
-              downloaded.contentType.includes('octet-stream'))
-          ) {
-            return await transcribeAudioBufferWithGemini(
-              downloaded.buffer,
-              downloaded.contentType.includes('audio/') ? downloaded.contentType : 'video/mp4',
-              {
-                sourceUrl: params.url,
-                normalizedUrl: parsed.normalizedUrl,
-                platform: parsed.platform,
-                title: discovered.title,
-                author: discovered.author,
-                languageHint: params.language,
-                includeSpeakers: params.includeSpeakers,
-              },
-            );
+      // Stop probing extra fallback pages once we already have both media and metadata
+      if (
+        (discovered.subtitleUrls.length > 0 ||
+          discovered.audioUrls.length > 0 ||
+          discovered.mediaUrls.length > 0) &&
+        discoveredTitle
+      ) {
+        break;
+      }
+    }
+  }
+
+  // 2a. Check discovered VTT/SRT subtitle tracks (works even without GEMINI_API_KEY)
+  for (const subUrl of Array.from(new Set(subtitleQueue))) {
+    try {
+      const subResp = await fetchWithTimeout(subUrl, { headers: BROWSER_HEADERS });
+      if (subResp.ok) {
+        const subText = await subResp.text();
+        const segs = parseVttOrSrtText(subText);
+        if (segs.length > 0) {
+          const baseResult: TranscriptResult = {
+            id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            sourceUrl: params.url,
+            normalizedUrl: parsed.normalizedUrl,
+            platform: parsed.platform,
+            title: discoveredTitle || `${getPlatformLabel(parsed.platform)} Transcript`,
+            author: discoveredAuthor,
+            language: 'Auto-detected',
+            durationSec: segs[segs.length - 1]?.endSec ?? 0,
+            extractionMethod: 'caption-track' as ExtractionMethod,
+            segments: segs,
+            createdAt: new Date().toISOString(),
+          };
+          if (params.language && params.language !== 'auto') {
+            return await translateTranscriptWithGemini(baseResult, params.language);
           }
-        } catch (err) {
-          if (err instanceof TranscriptionError && err.statusCode === 413) throw err;
+          return baseResult;
         }
       }
+    } catch {
+      // Try next subtitle URL
+    }
+  }
+
+  // 2b. Transcribe the target video's audio-only DASH track first, with progressive MP4 fallback
+  const seenStreamUrls = new Set<string>();
+  const uniqueAudio = streamQueue
+    .filter((item) => item.kind === 'audio')
+    .filter((item) => {
+      if (seenStreamUrls.has(item.url)) return false;
+      seenStreamUrls.add(item.url);
+      return true;
+    })
+    .slice(0, 1);
+
+  const uniqueVideo = streamQueue
+    .filter((item) => item.kind === 'video')
+    .filter((item) => {
+      if (seenStreamUrls.has(item.url)) return false;
+      seenStreamUrls.add(item.url);
+      return true;
+    })
+    .slice(0, 2);
+
+  const orderedStreams = [...uniqueAudio, ...uniqueVideo];
+
+  if (orderedStreams.length > 0 && !hasValidGeminiKey()) {
+    getGeminiClient(); // Throws clear GEMINI_API_KEY configuration error
+  }
+
+  for (const stream of orderedStreams) {
+    let downloaded: { buffer: Buffer; contentType: string } | null = null;
+    try {
+      downloaded = await downloadBoundedBytes(stream.url);
+    } catch (err) {
+      if (err instanceof TranscriptionError && err.statusCode === 413) throw err;
+      continue;
+    }
+
+    if (
+      !downloaded ||
+      downloaded.buffer.length <= 1024 ||
+      !(
+        downloaded.contentType.startsWith('video/') ||
+        downloaded.contentType.startsWith('audio/') ||
+        downloaded.contentType.includes('octet-stream')
+      )
+    ) {
+      continue;
+    }
+
+    const mimeType =
+      stream.kind === 'audio'
+        ? 'audio/mp4'
+        : downloaded.contentType.includes('audio/')
+          ? downloaded.contentType
+          : 'video/mp4';
+
+    try {
+      return await transcribeAudioBufferWithGemini(downloaded.buffer, mimeType, {
+        sourceUrl: params.url,
+        normalizedUrl: parsed.normalizedUrl,
+        platform: parsed.platform,
+        title: discoveredTitle,
+        author: discoveredAuthor,
+        languageHint: params.language,
+        includeSpeakers: params.includeSpeakers,
+      });
+    } catch (err) {
+      // If Gemini successfully inspected the audio and confirmed there is no speech, surface that immediately
+      if (err instanceof TranscriptionError && err.statusCode === 422) throw err;
+      // Otherwise fall through to the progressive video fallback (e.g., if a DASH audio container wasn't accepted without ffmpeg)
     }
   }
 

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSourceUrl, getPlatformLabel } from './urlParser';
 import {
+  decodeHtmlEntities,
   parseYouTubeJson3,
   parseYouTubeTimedTextXml,
   parseTimecodeToSeconds,
@@ -10,6 +11,12 @@ import {
   stripNarratorPrefix,
   sanitizeTranscriptResult,
 } from './transcriptParser';
+import {
+  buildPlatformFetchCandidates,
+  discoverMediaUrlsFromHtml,
+  extractInstagramShortcode,
+  unescapeEmbeddedUrl,
+} from './mediaDiscovery';
 import {
   formatTimestamp,
   formatSrtTimestamp,
@@ -224,3 +231,78 @@ test('narrator and voiceover labels or prefixes are stripped while multi-speaker
   assert.equal(cleanedResult.segments[0].speaker, undefined);
   assert.equal(cleanedResult.segments[0].text, 'Hello world.');
 });
+
+test('decodeHtmlEntities handles high Unicode emojis and mediaDiscovery extracts Facebook/Instagram streams', () => {
+  assert.equal(decodeHtmlEntities('&#x1f6a8; Thomas M&#xfc;ller &#xb7; Test'), '🚨 Thomas Müller · Test');
+
+  assert.equal(
+    extractInstagramShortcode('https://www.instagram.com/reel/DffPBZINF5g/?evlk=cWg1Y210aGltamNh'),
+    'DffPBZINF5g',
+  );
+  assert.deepEqual(
+    buildPlatformFetchCandidates('https://www.instagram.com/reel/DffPBZINF5g/?evlk=abc', 'instagram'),
+    [
+      'https://www.instagram.com/reel/DffPBZINF5g/?evlk=abc',
+      'https://www.instagram.com/p/DffPBZINF5g/embed/captioned/',
+      'https://www.instagram.com/reel/DffPBZINF5g/embed/',
+    ],
+  );
+  assert.deepEqual(
+    buildPlatformFetchCandidates('https://www.facebook.com/share/v/1CuNSCzuo8/', 'facebook'),
+    [
+      'https://www.facebook.com/share/v/1CuNSCzuo8/',
+      'https://m.facebook.com/share/v/1CuNSCzuo8/',
+    ],
+  );
+
+  // Double-escaped Instagram embed video_url
+  const doubleEscaped =
+    'https:\\\\\\/\\\\\\/scontent.cdninstagram.com\\\\\\/o1\\\\\\/clip.mp4?a=1\\\\u0026b=2';
+  assert.equal(
+    unescapeEmbeddedUrl(doubleEscaped),
+    'https://scontent.cdninstagram.com/o1/clip.mp4?a=1&b=2',
+  );
+
+  // Facebook desktop HTML with DASH audio + SD/HD streams + reactions og:title
+  const fbHtml = `
+    <meta property="og:title" content="2.2K reactions &#xb7; 283 shares | &#x1f6a8;Thomas M&#xfc;ller on MLS | UR Mamun" />
+    <script>
+      {"manifest":"audio\\/mp4\\" FBAvgBitrate=\\"51564\\">\\u003CBaseURL>https:\\/\\/video.fbcdn.net\\/audio.mp4?a=1&amp;b=2\\u003C\\/BaseURL>",
+       "browser_native_hd_url":"https:\\/\\/video.fbcdn.net\\/hd.mp4?q=hd",
+       "browser_native_sd_url":"https:\\/\\/video.fbcdn.net\\/sd.mp4?q=sd"}
+    </script>
+  `;
+  const fbDiscovered = discoverMediaUrlsFromHtml(fbHtml, 'facebook');
+  assert.equal(fbDiscovered.title, '🚨Thomas Müller on MLS');
+  assert.equal(fbDiscovered.author, 'UR Mamun');
+  assert.deepEqual(fbDiscovered.audioUrls, ['https://video.fbcdn.net/audio.mp4?a=1&b=2']);
+  assert.equal(fbDiscovered.mediaUrls[0], 'https://video.fbcdn.net/sd.mp4?q=sd');
+  assert.equal(fbDiscovered.mediaUrls[1], 'https://video.fbcdn.net/hd.mp4?q=hd');
+
+  // Instagram desktop HTML with video_versions + DASH audio + og:title
+  const igHtml = `
+    <meta property="og:title" content="Hassooni on Instagram: &quot;Debunking a huge myth&quot;" />
+    <script>
+      {"video_dash_manifest":"mimeType=\\"audio\\/mp4\\">\\u003CBaseURL>https:\\/\\/scontent.cdninstagram.com\\/dash-audio.mp4?k=1&amp;v=2\\u003C\\/BaseURL>",
+       "video_versions":[{"type":101,"width":720,"url":"https:\\/\\/scontent.cdninstagram.com\\/v720.mp4?t=1"},{"type":102,"width":480,"url":"https:\\/\\/scontent.cdninstagram.com\\/v480.mp4?t=2"}]}
+    </script>
+  `;
+  const igDiscovered = discoverMediaUrlsFromHtml(igHtml, 'instagram');
+  assert.equal(igDiscovered.title, 'Debunking a huge myth');
+  assert.equal(igDiscovered.author, 'Hassooni');
+  assert.deepEqual(igDiscovered.audioUrls, ['https://scontent.cdninstagram.com/dash-audio.mp4?k=1&v=2']);
+  assert.equal(igDiscovered.mediaUrls[0], 'https://scontent.cdninstagram.com/v480.mp4?t=2');
+  assert.equal(igDiscovered.mediaUrls[1], 'https://scontent.cdninstagram.com/v720.mp4?t=1');
+
+  // Instagram embed HTML with double-escaped gql_data video_url
+  const igEmbedHtml = `
+    <title>Instagram</title>
+    <script>
+      window.__data = "{\\"video_url\\":\\"https:\\\\\\/\\\\\\/scontent.cdninstagram.com\\\\\\/embed.mp4?x=1\\u0026y=2\\"}";
+    </script>
+  `;
+  const igEmbedDiscovered = discoverMediaUrlsFromHtml(igEmbedHtml, 'instagram');
+  assert.equal(igEmbedDiscovered.title, undefined);
+  assert.deepEqual(igEmbedDiscovered.mediaUrls, ['https://scontent.cdninstagram.com/embed.mp4?x=1&y=2']);
+});
+

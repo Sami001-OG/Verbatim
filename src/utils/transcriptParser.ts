@@ -24,8 +24,14 @@ const INLINE_NARRATOR_TAG_REGEX =
 export function decodeHtmlEntities(input: string): string {
   return input
     .replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp|#x27|#x2F);/g, (match) => HTML_ENTITIES[match] ?? match)
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#(\d+);/g, (match, code) => {
+      const num = Number(code);
+      return Number.isFinite(num) && num >= 0 && num <= 0x10ffff ? String.fromCodePoint(num) : match;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (match, hex) => {
+      const num = parseInt(hex, 16);
+      return Number.isFinite(num) && num >= 0 && num <= 0x10ffff ? String.fromCodePoint(num) : match;
+    });
 }
 
 export function sanitizeSpeakerLabel(speaker?: string): string | undefined {
